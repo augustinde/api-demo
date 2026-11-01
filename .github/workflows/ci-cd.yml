@@ -1,0 +1,109 @@
+# Construit l'image, la publie sur GHCR, puis la déploie sur le cluster k3s-test.
+#
+# Côté GitHub (voir la procédure k3s, étape 0) :
+#   Settings > Environments > test (branche main uniquement)
+#     secrets   CF_ACCESS_CLIENT_ID, CF_ACCESS_CLIENT_SECRET   (jeton de service Cloudflare Access)
+#   Settings > Secrets and variables > Actions > Variables (niveau dépôt)
+#     K8S_API_HOST   k8s-api-test.<domaine>     (vide = le déploiement est ignoré)
+#     K8S_CA_DATA    sortie de `make ci-ca`
+#     APP_HOST       api-demo-test.<domaine>
+# Aucun jeton Kubernetes n'est stocké : l'identité vient de GitHub (OIDC).
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag de l'image
+        id: meta
+        run: echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    # Ignoré tant que la variable K8S_API_HOST n'est pas définie (cluster pas encore prêt)
+    if: vars.K8S_API_HOST != ''
+    runs-on: ubuntu-latest
+    environment: test        # fait partie de l'identité OIDC : github:<dépôt>:test
+    permissions:
+      contents: read
+      id-token: write        # jeton OIDC GitHub, accepté par l'API k3s
+    env:
+      K8S_AUDIENCE: k3s-test
+      NAMESPACE: demo
+      RELEASE: api-demo
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer cloudflared
+        run: |
+          curl -fsSL -o /tmp/cloudflared.deb \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i /tmp/cloudflared.deb
+
+      - name: Ouvrir l'accès à l'API (Cloudflare Access)
+        env:
+          CF_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          API_HOST: ${{ vars.K8S_API_HOST }}
+        run: |
+          nohup cloudflared access tcp --hostname "$API_HOST" --url 127.0.0.1:16443 \
+            --service-token-id "$CF_ID" --service-token-secret "$CF_SECRET" \
+            > /tmp/cloudflared.log 2>&1 &
+          for _ in $(seq 1 30); do
+            (exec 3<>/dev/tcp/127.0.0.1/16443) 2>/dev/null && break
+            sleep 1
+          done
+
+      - name: Kubeconfig OIDC
+        run: bash deploy/write-kubeconfig.sh "${{ vars.K8S_CA_DATA }}" "$K8S_AUDIENCE" "$NAMESPACE"
+
+      - name: Vérifier l'identité
+        run: kubectl auth whoami
+
+      - name: Déployer
+        run: |
+          helm upgrade --install "$RELEASE" deploy/chart -n "$NAMESPACE" \
+            -f deploy/values-test.yaml \
+            --set image.tag="${{ needs.build.outputs.tag }}" \
+            --set ingress.host="${{ vars.APP_HOST }}" \
+            --wait --timeout 5m --history-max 5
+
+      - name: Journal cloudflared
+        if: failure()
+        run: cat /tmp/cloudflared.log

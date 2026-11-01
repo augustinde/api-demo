@@ -1,0 +1,5 @@
+apiVersion: v2
+name: app
+description: Chart générique pour un service HTTP (Deployment, Service, Ingress TLS, connexion PostgreSQL CNPG)
+type: application
+version: 1.0.0

@@ -1,0 +1,72 @@
+nameOverride: ""
+
+image:
+  repository: ""
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Secret de registre privé créé par le chart tenant (ex. ghcr-pull)
+imagePullSecrets: []
+
+replicas: 1
+containerPort: 8080
+args: []
+
+# Variables d'environnement en clair
+env: {}
+
+# Secrets existants du namespace injectés en variables d'environnement
+# (créés par le chart tenant depuis environments/<env>.secrets.yaml, ex. api-env)
+envFromSecrets: []
+
+# Variables sensibles portées par la release elle-même (services déployés par Helmfile uniquement)
+secretEnv: {}
+
+# Connexion à un cluster CloudNativePG du même namespace.
+# Injecte <envPrefix>_URL, _USERNAME et _PASSWORD (préfixe Spring Boot par défaut).
+database:
+  enabled: false
+  cluster: ""        # nom du cluster CNPG (ex. app)
+  name: ""           # nom de la base (ex. app)
+  envPrefix: SPRING_DATASOURCE
+
+probes:
+  startup:
+    path: ""                # vide = pas de startupProbe (utile pour les JVM lentes à démarrer)
+    failureThreshold: 30    # 30 × 5 s = 150 s maximum pour démarrer
+  liveness:
+    path: /
+  readiness:
+    path: /
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+# Conforme au niveau Pod Security "restricted" imposé aux namespaces applicatifs.
+# runAsUser doit correspondre à un utilisateur non-root de l'image.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+
+service:
+  port: 80
+
+# TLS terminé par Cloudflare : l'Ingress est servi en HTTP par Traefik, derrière le tunnel
+ingress:
+  enabled: true
+  className: traefik
+  host: ""            # fourni par Helmfile : <nom><suffixe>.<zone>
+  path: /
+  annotations: {}

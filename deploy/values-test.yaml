@@ -1,0 +1,47 @@
+# Valeurs du chart deploy/chart pour l'environnement de test (cluster k3s-test, namespace demo).
+# image.tag et ingress.host sont fournis par le workflow GitHub (--set).
+image:
+  repository: ghcr.io/augustinde/api-demo
+  tag: ""
+
+# Paquet GHCR privé ? Créer le secret ghcr-pull (tenants.demo.registry dans k3s-lab) et décommenter.
+# imagePullSecrets:
+#   - name: ghcr-pull
+
+containerPort: 8080
+
+env:
+  JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError"
+
+# Base CloudNativePG "app" du même namespace : injecte SPRING_DATASOURCE_URL/USERNAME/PASSWORD
+database:
+  enabled: true
+  cluster: app
+  name: app
+
+probes:
+  startup:
+    path: /actuator/health/liveness
+    failureThreshold: 36
+  liveness:
+    path: /actuator/health/liveness
+  readiness:
+    path: /actuator/health/readiness
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 320Mi
+  limits:
+    memory: 640Mi
+
+# Utilisateur non-root de l'image (USER 1000:1000 dans le Dockerfile)
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+ingress:
+  host: ""

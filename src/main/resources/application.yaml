@@ -1,0 +1,30 @@
+spring:
+  application:
+    name: api-demo
+  # En local : base exposée par `make db-forward DB=app` (k3s-lab) ou un PostgreSQL local.
+  # Dans le cluster, les variables SPRING_DATASOURCE_URL/USERNAME/PASSWORD (injectées par le chart
+  # depuis le secret CloudNativePG app-app) remplacent ces valeurs.
+  datasource:
+    url: jdbc:postgresql://localhost:5432/app
+    username: app
+    password: app
+
+server:
+  port: 8080
+  # Derrière Cloudflare et Traefik : respecter X-Forwarded-Proto/Host
+  forward-headers-strategy: framework
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        # Le pod ne reçoit du trafic que si PostgreSQL répond
+        readiness:
+          include: readinessState,db
