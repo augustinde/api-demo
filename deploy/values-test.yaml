@@ -1,5 +1,5 @@
 # Valeurs du chart deploy/chart pour l'environnement de test (cluster k3s-test, namespace demo).
-# image.tag et ingress.host sont fournis par le workflow GitHub (--set).
+# image.tag est fourni par le workflow GitHub (--set).
 image:
   repository: ghcr.io/augustinde/api-demo
   tag: ""
@@ -44,4 +44,4 @@ podSecurityContext:
     type: RuntimeDefault
 
 ingress:
-  host: ""
+  host: api-demo-test.augustinde.dev

@@ -37,12 +37,22 @@ Sondes Kubernetes : `/actuator/health/liveness` et `/actuator/health/readiness`
 
 ## Déploiement
 
-À chaque push sur `main`, `.github/workflows/ci-cd.yml` :
+`.github/workflows/ci-cd.yml` :
 
-1. construit l'image et la publie sur `ghcr.io/augustinde/api-demo` (tags `sha-<commit>` et `latest`) ;
-2. la déploie sur le cluster k3s-test (namespace `demo`) avec Helm, en s'authentifiant par OIDC GitHub
-   derrière Cloudflare Access. Aucun jeton Kubernetes n'est stocké chez GitHub.
+| Événement | Ce qui se passe |
+| --- | --- |
+| pull request (dont Renovate) | build de contrôle, rien n'est publié |
+| push sur `main` | image `ghcr.io/augustinde/api-demo:sha-<commit>`, déployée en **test** : `https://api-demo-test.augustinde.dev` (namespace `demo`) |
+| tag `v1.2.3` | la même image, réétiquetée `v1.2.3`, déployée en **prod** : `https://api-demo.augustinde.dev` (namespace `demo-prod`) |
 
-Les identifiants de la base sont injectés par le chart depuis le secret `app-app` généré par CloudNativePG.
+Mettre en production le commit actuellement en test :
+
+```bash
+git tag v1.0.0 && git push origin v1.0.0
+```
+
+Le tag doit porter sur un commit déjà construit sur `main`, sinon le job `release` s'arrête.
+Authentification par OIDC GitHub derrière Cloudflare Access : aucun jeton Kubernetes n'est stocké chez GitHub.
 Le déploiement est ignoré tant que la variable `K8S_API_HOST` n'est pas définie.
-Configuration côté GitHub : voir l'étape 0 de la procédure k3s.
+Configuration côté GitHub : étapes 0, 10 et 11 de la procédure k3s.
+Les dépendances sont suivies par Renovate (`renovate.json`) : correctifs fusionnés automatiquement, le reste à valider.

@@ -1,0 +1,76 @@
+# Déploiement Helm sur le cluster k3s, appelé par ci-cd.yml pour test et pour prod.
+# L'API n'est joignable qu'à travers Cloudflare Access (jeton de service) ; l'identité
+# Kubernetes est le jeton OIDC du job : github:augustinde/api-demo:<environnement>.
+name: Déploiement
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Environnement GitHub (test ou prod), qui fait partie de l'identité OIDC
+        type: string
+        required: true
+      namespace:
+        type: string
+        required: true
+      values-file:
+        type: string
+        required: true
+      image-tag:
+        type: string
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    # Un seul déploiement à la fois par environnement
+    concurrency:
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write        # jeton OIDC GitHub, accepté par l'API k3s
+    env:
+      K8S_AUDIENCE: k3s-test
+      NAMESPACE: ${{ inputs.namespace }}
+      RELEASE: api-demo
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer cloudflared
+        run: |
+          curl -fsSL -o /tmp/cloudflared.deb \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i /tmp/cloudflared.deb
+
+      - name: Ouvrir l'accès à l'API (Cloudflare Access)
+        env:
+          CF_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          API_HOST: ${{ vars.K8S_API_HOST }}
+        run: |
+          nohup cloudflared access tcp --hostname "$API_HOST" --url 127.0.0.1:16443 \
+            --service-token-id "$CF_ID" --service-token-secret "$CF_SECRET" \
+            > /tmp/cloudflared.log 2>&1 &
+          for _ in $(seq 1 30); do
+            (exec 3<>/dev/tcp/127.0.0.1/16443) 2>/dev/null && break
+            sleep 1
+          done
+
+      - name: Kubeconfig OIDC
+        run: bash deploy/write-kubeconfig.sh "${{ vars.K8S_CA_DATA }}" "$K8S_AUDIENCE" "$NAMESPACE"
+
+      - name: Vérifier l'identité
+        run: kubectl auth whoami
+
+      - name: Déployer ${{ inputs.image-tag }} en ${{ inputs.environment }}
+        run: |
+          helm upgrade --install "$RELEASE" deploy/chart -n "$NAMESPACE" \
+            -f "${{ inputs.values-file }}" \
+            --set image.tag="${{ inputs.image-tag }}" \
+            --wait --timeout 5m --history-max 5
+
+      - name: Journal cloudflared
+        if: failure()
+        run: cat /tmp/cloudflared.log
