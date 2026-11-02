@@ -1,0 +1,42 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":timezone(Europe/Paris)"
+  ],
+  "schedule": [
+    "before 9am on monday"
+  ],
+  "labels": [
+    "dépendances"
+  ],
+  "dependencyDashboard": true,
+  "platformAutomerge": false,
+  "packageRules": [
+    {
+      "description": "Correctifs : fusionnés automatiquement si le build de la pull request passe (puis déployés en test)",
+      "matchUpdateTypes": [
+        "patch",
+        "pin",
+        "digest"
+      ],
+      "groupName": "correctifs",
+      "automerge": true
+    },
+    {
+      "description": "Mises à jour mineures : regroupées dans une pull request à valider",
+      "matchUpdateTypes": [
+        "minor"
+      ],
+      "groupName": "mises à jour mineures",
+      "automerge": false
+    },
+    {
+      "description": "Versions majeures : une pull request par dépendance, toujours à valider",
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "automerge": false
+    }
+  ]
+}

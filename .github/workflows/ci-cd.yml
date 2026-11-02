@@ -1,28 +1,36 @@
-# Construit l'image, la publie sur GHCR, puis la déploie sur le cluster k3s-test.
+# Construit l'image, la déploie en test sur main, et en prod sur un tag de version.
 #
-# Côté GitHub (voir la procédure k3s, étape 0) :
-#   Settings > Environments > test (branche main uniquement)
-#     secrets   CF_ACCESS_CLIENT_ID, CF_ACCESS_CLIENT_SECRET   (jeton de service Cloudflare Access)
-#   Settings > Secrets and variables > Actions > Variables (niveau dépôt)
-#     K8S_API_HOST   k8s-api-test.<domaine>     (vide = le déploiement est ignoré)
-#     K8S_CA_DATA    sortie de `make ci-ca`
-#     APP_HOST       api-demo-test.<domaine>
+#   pull request  → build de contrôle (rien n'est publié ni déployé)
+#   push sur main → image ghcr.io/augustinde/api-demo:sha-<commit>, déployée en test (namespace demo)
+#   tag v1.2.3    → la MÊME image, réétiquetée v1.2.3, déployée en prod (namespace demo-prod)
+#
+# Côté GitHub (procédure k3s, étapes 0, 10 et 11) :
+#   Variables de dépôt     K8S_API_HOST (vide = aucun déploiement), K8S_CA_DATA (make ci-ca)
+#   Environnement test     branche main ; secrets CF_ACCESS_CLIENT_ID, CF_ACCESS_CLIENT_SECRET
+#   Environnement prod     tags v* ; mêmes secrets
 # Aucun jeton Kubernetes n'est stocké : l'identité vient de GitHub (OIDC).
 name: CI/CD
 
 on:
   push:
     branches: [main]
+    tags: ["v*"]
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
   build:
+    if: github.ref_type != 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -39,71 +47,73 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Sur une pull request (dont celles de Renovate) : build de contrôle, rien n'est publié
       - uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: |
             ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
             ${{ env.IMAGE }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  deploy:
+  deploy-test:
     needs: build
-    # Ignoré tant que la variable K8S_API_HOST n'est pas définie (cluster pas encore prêt)
-    if: vars.K8S_API_HOST != ''
-    runs-on: ubuntu-latest
-    environment: test        # fait partie de l'identité OIDC : github:<dépôt>:test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.K8S_API_HOST != ''
     permissions:
       contents: read
-      id-token: write        # jeton OIDC GitHub, accepté par l'API k3s
-    env:
-      K8S_AUDIENCE: k3s-test
-      NAMESPACE: demo
-      RELEASE: api-demo
+      id-token: write
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: test
+      namespace: demo
+      values-file: deploy/values-test.yaml
+      image-tag: ${{ needs.build.outputs.tag }}
+    secrets: inherit
+
+  # Tag v* : aucune reconstruction. L'image construite pour ce commit sur main (donc déjà
+  # passée en test) reçoit le tag de version, et c'est elle qui part en prod.
+  release:
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
 
-      - name: Installer cloudflared
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Réétiqueter l'image testée en ${{ github.ref_name }}
         run: |
-          curl -fsSL -o /tmp/cloudflared.deb \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i /tmp/cloudflared.deb
+          SRC="$IMAGE:sha-${GITHUB_SHA::7}"
+          if ! docker buildx imagetools inspect "$SRC" > /dev/null 2>&1; then
+            echo "::error::Image $SRC introuvable : ce commit n'a pas été construit sur main. Pousse-le sur main, vérifie-le en test, puis pose le tag."
+            exit 1
+          fi
+          docker buildx imagetools create --tag "$IMAGE:$GITHUB_REF_NAME" "$SRC"
 
-      - name: Ouvrir l'accès à l'API (Cloudflare Access)
-        env:
-          CF_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
-          CF_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
-          API_HOST: ${{ vars.K8S_API_HOST }}
-        run: |
-          nohup cloudflared access tcp --hostname "$API_HOST" --url 127.0.0.1:16443 \
-            --service-token-id "$CF_ID" --service-token-secret "$CF_SECRET" \
-            > /tmp/cloudflared.log 2>&1 &
-          for _ in $(seq 1 30); do
-            (exec 3<>/dev/tcp/127.0.0.1/16443) 2>/dev/null && break
-            sleep 1
-          done
-
-      - name: Kubeconfig OIDC
-        run: bash deploy/write-kubeconfig.sh "${{ vars.K8S_CA_DATA }}" "$K8S_AUDIENCE" "$NAMESPACE"
-
-      - name: Vérifier l'identité
-        run: kubectl auth whoami
-
-      - name: Déployer
-        run: |
-          helm upgrade --install "$RELEASE" deploy/chart -n "$NAMESPACE" \
-            -f deploy/values-test.yaml \
-            --set image.tag="${{ needs.build.outputs.tag }}" \
-            --set ingress.host="${{ vars.APP_HOST }}" \
-            --wait --timeout 5m --history-max 5
-
-      - name: Journal cloudflared
-        if: failure()
-        run: cat /tmp/cloudflared.log
+  deploy-prod:
+    needs: release
+    if: vars.K8S_API_HOST != ''
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: prod
+      namespace: demo-prod
+      values-file: deploy/values-prod.yaml
+      image-tag: ${{ github.ref_name }}
+    secrets: inherit
