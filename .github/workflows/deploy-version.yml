@@ -1,0 +1,98 @@
+# Déploie une image déjà construite, lancé à la main : Actions, Déployer, Run workflow (branche main).
+#
+#   test : version vide = dernier commit de main (sha-<commit>), ou une version vX.Y.Z, ou sha-xxxxxxx
+#   prod : une version publiée par Release (vX.Y.Z) ; sert aussi au retour arrière
+name: Déployer
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environnement
+        type: choice
+        options: [test, prod]
+        default: test
+      version:
+        description: "Version : vX.Y.Z, ou sha-xxxxxxx (test) ; vide = dernier commit de main (test)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      namespace: ${{ steps.tag.outputs.namespace }}
+      values-file: ${{ steps.tag.outputs.values-file }}
+    steps:
+      - name: Lancé depuis main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Lance le déploiement depuis la branche main (Use workflow from : main)."
+          exit 1
+
+      - name: Image à déployer
+        id: tag
+        env:
+          TARGET: ${{ inputs.environment }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ -z "$VERSION" ]; then
+            if [ "$TARGET" = prod ]; then
+              echo "::error::En prod, indique la version (vX.Y.Z) publiée par Release."; exit 1
+            fi
+            VERSION="sha-${GITHUB_SHA::7}"
+          fi
+          if [ "$TARGET" = prod ] && ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::En prod, seules les versions vX.Y.Z publiées par Release sont acceptées (reçu : $VERSION)."; exit 1
+          fi
+          if ! [[ "$VERSION" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+|sha-[0-9a-f]{7})$ ]]; then
+            echo "::error::Version invalide : $VERSION (attendu vX.Y.Z ou sha-xxxxxxx)."; exit 1
+          fi
+          case "$TARGET" in
+            test) NS=demo;      VALUES=deploy/values-test.yaml ;;
+            prod) NS=demo-prod; VALUES=deploy/values-prod.yaml ;;
+          esac
+          echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "namespace=$NS" >> "$GITHUB_OUTPUT"
+          echo "values-file=$VALUES" >> "$GITHUB_OUTPUT"
+          echo "Déploiement de \`$IMAGE:$VERSION\` en **$TARGET** (namespace $NS)" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Vérifier que l'image existe
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          docker buildx imagetools inspect "$IMAGE:$TAG" > /dev/null 2>&1 || {
+            echo "::error::Image $IMAGE:$TAG introuvable (build en cours, ou version jamais publiée)."; exit 1; }
+
+  deploy:
+    needs: resolve
+    if: vars.K8S_API_HOST != ''
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: ${{ inputs.environment }}
+      namespace: ${{ needs.resolve.outputs.namespace }}
+      values-file: ${{ needs.resolve.outputs.values-file }}
+      image-tag: ${{ needs.resolve.outputs.tag }}
+    secrets: inherit
