@@ -1,0 +1,136 @@
+# Nouvelle version en prod, lancée à la main : Actions, Release, Run workflow (branche main).
+#
+#   1. calcule la version suivante depuis le dernier tag vX.Y.Z (patch, minor ou major)
+#   2. vérifie que l'image sha-<commit> existe : le commit a été construit sur main
+#   3. réétiquette CETTE image en vX.Y.Z (aucune reconstruction)
+#   4. crée le tag et la Release GitHub, avec les notes générées depuis la version précédente
+#   5. déploie en prod
+#
+# Le tag est créé avec le jeton du workflow : il ne déclenche aucun autre workflow.
+# Environnement GitHub prod : autoriser la branche main (et, conseillé, Required reviewers).
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Type de version (1.4.2 → patch 1.4.3, minor 1.5.0, major 2.0.0)
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      commit:
+        description: Commit de main à livrer (vide = dernier commit de main)
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# Une release à la fois, jamais annulée en cours
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # tag et Release GitHub
+      packages: write        # nouveau tag de l'image
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Lancé depuis main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Lance la release depuis la branche main (Run workflow, Use workflow from : main)."
+          exit 1
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # historique et tags, pour calculer la version et les notes
+
+      - name: Commit à livrer
+        id: commit
+        env:
+          INPUT_COMMIT: ${{ inputs.commit }}
+        run: |
+          SHA=$(git rev-parse --verify "${INPUT_COMMIT:-origin/main}^{commit}") || {
+            echo "::error::Commit introuvable : ${INPUT_COMMIT}"; exit 1; }
+          if ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "::error::Le commit $SHA n'est pas sur main."; exit 1
+          fi
+          DEJA=$(git tag --points-at "$SHA" --list 'v[0-9]*' | head -1)
+          if [ -n "$DEJA" ]; then
+            echo "::error::Le commit ${SHA::7} est déjà publié en $DEJA."; exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=${SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Version suivante
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          PREVIOUS=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)
+          IFS=. read -r MAJOR MINOR PATCH <<< "${PREVIOUS#v}"
+          MAJOR=${MAJOR:-0}; MINOR=${MINOR:-0}; PATCH=${PATCH:-0}
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+          VERSION="v$MAJOR.$MINOR.$PATCH"
+          if git rev-parse -q --verify "refs/tags/$VERSION" > /dev/null; then
+            echo "::error::Le tag $VERSION existe déjà."; exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "previous=$PREVIOUS" >> "$GITHUB_OUTPUT"
+          echo "Version : ${PREVIOUS:-aucune} → **$VERSION** ($BUMP), commit \`${{ steps.commit.outputs.short }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Réétiqueter l'image construite pour ce commit
+        env:
+          SRC_TAG: sha-${{ steps.commit.outputs.short }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if ! docker buildx imagetools inspect "$IMAGE:$SRC_TAG" > /dev/null 2>&1; then
+            echo "::error::Image $IMAGE:$SRC_TAG introuvable : le build de ce commit sur main n'est pas terminé ou a échoué."
+            exit 1
+          fi
+          docker buildx imagetools create --tag "$IMAGE:$VERSION" "$IMAGE:$SRC_TAG"
+
+      - name: Créer le tag et la Release GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.commit.outputs.sha }}
+          VERSION: ${{ steps.version.outputs.version }}
+          PREVIOUS: ${{ steps.version.outputs.previous }}
+        run: |
+          gh release create "$VERSION" --target "$SHA" --title "$VERSION" \
+            --generate-notes ${PREVIOUS:+--notes-start-tag "$PREVIOUS"}
+
+  deploy-prod:
+    needs: release
+    if: vars.K8S_API_HOST != ''
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: prod
+      namespace: demo-prod
+      values-file: deploy/values-prod.yaml
+      image-tag: ${{ needs.release.outputs.version }}
+    secrets: inherit
